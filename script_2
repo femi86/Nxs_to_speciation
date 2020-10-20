@@ -34,12 +34,12 @@ operations to do:
         - allignment --> find index of image to allign in list, apply allignment to all, save in folder allignment
 
         - make cutoff masks on 15 keV map (mask_cut):
-            - histogram (np.histogram) Tl background vs concretions --> evaluate counts and mask (all below value are 0)
-            - histogram (np.histogram) Mn counts background --> histogram, set value for bg, select only values that are 5-10 times bg
+            - histogram (np.histogram) El1 background vs concretions --> evaluate counts and mask (all below value are 0)
+            - histogram (np.histogram) El2 counts background --> histogram, set value for bg, select only values that are 5-10 times bg
 
         - make masks based on cutoff (mask):
             - apply cutoff mask
-            - divide Tl/Mn image (15 keV)
+            - divide El1/El2 image (15 keV)
             - np.histogram, select ranges (maskN)
         - LCF_all of all images
         - LCF_mask of masked regions:
@@ -63,370 +63,84 @@ may be due to normalization?
 
 Also, the normalization may not be optimal now.
 
+
+
+Update 2020 07 30
+
+generalization of the script. the script reads in maps at different energies, 
+alligns them based on one element that does not change and has enough features
+for the algorithm, and then gives the results in terms of LCF (element 1 at 2 
+oxidation states), in terms of element 1 / element 2 ratios, and also with a
+third element if needed.
+
+it reads in an hdf5 file that is generated from another script, that reads in 
+FDA files
+
+
 '''
 import os, glob, sys
 from PIL import Image
 import numpy as np
+import matplotlib.pyplot as plt
 from skimage.io import imread
-from skimage.feature import register_translation
+from skimage.registration import phase_cross_correlation 
 import scipy as sp
 import pandas as pd
+import seaborn as sns
 import cv2 # this one needs to be manually installed, get the latest opencv distribution and follow the instructions there
-import itertools
-
+import marafatto_useful_libs as mul
+import h5py
 '''
 user input
 '''
 # DIRECTORIES (values):
-path = r'E:\Dropbox\Post-doc\data\Diamond_jul18\LCF_out'
-run_all = 0 # select 1 to run all or 0 to only run one, specify in list below
-run = ['PI_38_w1_ar1'] # name which map should be run, if run_all = 0
-refs_ox = r'E:\\Dropbox\\Post-doc\\data\\Diamond_jul18\\refs\\Tl_III'
-refs_red = r'E:\\Dropbox\\Post-doc\\data\\Diamond_jul18\\refs\\Tl_I'
-ignore = ['ignore','Tl_Mn_3_hole_eV_map2','Tl_Mn_3_hole_eV_map1'] # folders in the input dir to ignore
+path: str = r'E:\switchdrive\phoenix_jul20\fda_program\data\2020'
+run_all = 1 # select 1 to run all or 0 to only run one, specify in list below
+run = [''] # name which map should be run, if run_all = 0
+refs_ox: str = r'E:\Dropbox\Post-Doc_II\data\phoenix\2020\refs\ox'
+refs_red: str = r'E:\Dropbox\Post-Doc_II\data\phoenix\2020\refs\red'
+ignore = [''] # folders in the input dir to ignore
 
 #PROCESSING:
 ROI_opt = 0 # 1 if you want to run on rois, 0 if you want to run the full map as one single roi. will contain also pixel-wise LCF
-sel_roi = 0 # 1 if you want to select new rois, 0 if you want to use ones that were predefined before 
-roi_lcf = 0 # 0 if you just want to do the averages of the rois, 1 if you want to get the images of the rois with lcf pixel by pixel
-grid = 1 # 1 if you want to read the grid values, 0 if none are available
-moving_avg = 1
+sel_roi = 1 # 1 if you want to select new rois, 0 if you want to use ones that were predefined before
+roi_lcf = 1 # 0 if you just want to just do the averages of the rois, 1 if you want to get the images of the rois with lcf pixel by pixel
+moving_avg = 0 # if to make a moving average on the data or not
 movavg_shape = 0 # shape of the moving average, 1 for gaussian blur or 0 for normal blur
 mov_bin = 3 # the bin for the moving average
 
-mask = 1 # select if you want to mask the numerator 
+mask = 0 # select if you want to mask the numerator 
 opt = 1 # edge step filter option
 edge_ratio = 3 # edge step threshold to accept (x times the edge step)
+El1_masking = 0 # 1 if you want to mask based on an element, 0 if not
+El1_threshold = 220 # the value for the hi energy, attenuation corrected El map for which the El background is eliminated
 
 #RATIO (values):
-alg_el = 'sort_Fe-Ka'
-mask_num = 'sort_Tl-La'
-mask_num_15 = 'sort_Tl-Lb' # if 15 keV, the element to use is the Lb of Tl since it does not overlap with As
-mask_den = 'sort_Mn-Ka'
-third_element = 'sort_As-Ka'
-master_energy = 1 # select 1 to use the highest energy for the ratio, 0 to use the pymca 15 keV map (will add deconv if 0), 2 to use the 15 keV roi map and Tl-Lb (will add 15kev_roi)
-energy_ch = '_pymca','_hiEn','_15kevRoi' # the naming scheme that is used for the data as a function of the master energy parameter chosen
+alg_el = 'KKa_sum_cps' # element to use for the allignment
+El1_name = 'SKa_sum_cps' # element for the numerator
+El2_name = 'FeKa_sum_cps' # element to use as the denominator, element 2
+El3_name = 'CaKa_sum_cps'
+
+X_name = 'ScanX_set'
+Y_name ='ScanY_set'
 out_chem = '15000' # energy not part of chemical imaging
-den_cts_fact = 3 # a factor for the threshold of the denominator ??
-num_cts_fact = 3 # a factor for the threshold of the numerator ??
-min_hist_cts = 3 # minimum number of histogram counts for the mask to exist
-bins_ratio = 30 # how many bins to divide the num/den ratio into for the masks
-hist_den_bins = 256 # how many bins to divide the denominator into, to select concretions
-bg_bins = 3 # how many bins for the background masks
+
 
 #ATTENUATION (values): multiply by tx, divide by attenuation, this is when not using 15 kev map. must be in same order as els_to_use variable
+atten_on = 0 # 1 if you want to correct attenuation, 0 if only raw values
+num_scal = 0.005 # if no attenuation, enter the value you want to scale the numerator if there is an external calibration for example
 els_to_use = ['sort_Tl-La','sort_Mn-Ka','sort_As-Ka']
-tx_Tl = 0.4061
-tx_Mn = 0.0016
-tx_As = 0.00033
 
-att_mass_Tl = 204.39*165.033 #g/mol * cm2/g
-att_mass_Mn = 54.95*77.955
-att_mass_As = 74.92*148.610
+
 #OTHER TOOLS
 variant_comparison = 0 # in order to compare different datasets, the masks need to be identical to the first map
 
-'''
-function definition
-'''
-
-def safe_mkdir(file_path):
-    if not os.path.exists(file_path):
-        os.makedirs(file_path)
-
-def find_nearest(a, a0):
-    "Element in nd array `a` closest to the scalar value `a0`"
-    idx = np.abs(a - a0).argmin()
-    return a.flat[idx]
-
-def progbar(text,curr, total, full_progbar):
-    frac = curr/total
-    filled_progbar = round(frac*full_progbar)
-    #print('\r','\t '+'#'*filled_progbar + '-'*(full_progbar-filled_progbar), '{:>7.2%}'.format(frac), end='')
-    text = '\t'+text+': '+'#'*filled_progbar + '-'*(full_progbar-filled_progbar)+ '{:>7.2%}'.format(frac)
-    sys.stdout.write('\r'+text)
-    sys.stdout.flush()
-
-def mov_avg(array):
-    if movavg_shape == 1:
-        result = cv2.GaussianBlur(array,(mov_bin,mov_bin),0)
-    elif movavg_shape == 0:
-        result = cv2.blur(array,(mov_bin,mov_bin))
-    return result
-
-def RGB_fun(arR,arG,arB):
-    R = np.array(np.around(arR/np.nanmax(arR)*256),np.uint8)
-    G = np.array(np.around(arG/np.nanmax(arG)*256),np.uint8)
-    B = np.array(np.around(arB/np.nanmax(arB)*256),np.uint8)
-    RGB = cv2.merge((B,G,R))
-    return RGB
-
-def ROIs(sel_roi,el_norm, num, den, directory): 
-    '''
-    this function reads in alligned images from a chemical map, allows the user to
-    select a series of rois, then saves each selected roi in individual objects
-    for further independent processing.
-    '''
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    ROI = {} # first roi is the fullmap
-    roi_coord = {}
-    roi_masks = {}
-    loop = True
-    count = 1
-    Tl = num
-    empty = np.zeros(np.shape(Tl))
-    canv_incr = 10
-    def inc_canv(array): # this is set for rgb images, so considers a 3d array where 3rd dimension is RGB
-        row = np.zeros((canv_incr,np.shape(array)[1],3),np.uint8)
-        col = np.zeros((np.shape(array)[0]+canv_incr*2,canv_incr,3),np.uint8)
-        return np.hstack((col,np.vstack((row,array,row)),col))
-    Mn = den
-    image1 = RGB_fun(Tl/np.nanmax(Tl),empty,Mn/np.nanmax(Tl))
-    image2 = RGB_fun(Tl,empty,Mn)
-    try:
-        image4 = cv2.imread(os.path.join(dirname,'fullmap','LCF', 'fullmap_redR_nanG_oxB_TlIntScale.tif'))
-    except:
-        print('fullmap not available, check the directory, or run full lcf first')
-        image4 = RGB_fun(empty,empty,empty)    
-    outimage1 = inc_canv(image1)
-    outimage2 = inc_canv(image2)
-    outimage3 = inc_canv(RGB_fun(empty,empty,empty))
-    images = [outimage1,outimage2,outimage3]
-    image_names = ['ROIs_RTl_BMn_debug.tif','ROIs_TlMnRatio.tif','only_areas.tif']
-    if not sel_roi:
-        try:
-            roi_coord = pd.read_csv(os.path.join(directory,'roi_coordinates.csv'))
-        except:
-            raise  ValueError('no such file as roi_coordinates.csv in the output folder')
-            print(ValueError)
-        for r in range(roi_coord.shape[0]):
-            X1,Y1,width,height = int(roi_coord['X1'][r]),int(roi_coord['Y1'][r]),int(roi_coord['width'][r]),int(roi_coord['height'][r])
-            ROI['roi_n'+str(r+1)] = el_norm[:,Y1:Y1+height, X1:X1+width]
-            roi_masks['roi_n'+str(r+1)] = [Y1,Y1+height,X1,X1+width]
-            X1_shift, Y1_shift = X1+canv_incr, Y1+canv_incr
-            center = (X1_shift,Y1_shift-2)
-            for image in images:
-                cv2.rectangle(image,(X1_shift,Y1_shift),(X1_shift+width,Y1_shift+height),(255,0,0),2)
-                cv2.putText(image,'ROI'+str(r+1),center,font,0.5,(255,0,0),1) 
-        [cv2.imwrite(os.path.join(directory,samp_name+img_n),image) for image in images for img_n in image_names]
-
-    #%%
-    elif sel_roi:
-        while loop:
-            roi_ID = 'ROI{}'.format(str(count))
-            cv2.imshow('Tl red vs Mn blue map',outimage2)
-            print('select on Tl redox image Roi n.{}, then hit \n enter twice to continue, or \n enter + q to stop'.format(roi_ID))
-            r = cv2.selectROI('Tl red, Mn blue, scaled by Tl intensity',image1,False) # the image here should be the Tl/Mn ratio, with also a plot of Tl max intensity?
-            roi_coord['roi'+str(count)] = [int(r[0]),int(r[1]),int(r[2]),int(r[3])]
-            k = cv2.waitKey(0) # this is to read the quit signal
-            if k == ord('q'):
-                loop=False
-                for n,image in enumerate(images):
-                    cv2.imwrite(os.path.join(directory,samp_name+image_names[n]),image)
-                print('ok, exiting roi selection')
-            else:
-                ROI['roi_n'+str(count)] = el_norm[:,int(r[1]):int(r[1]+r[3]), int(r[0]):int(r[0]+r[2])]
-                roi_masks['roi_n'+str(count)] = [int(r[1]),int(r[1]+r[3]),int(r[0]),int(r[0]+r[2])]
-                X1_shift, Y1_shift = int(r[0])+3, int(r[1])+3
-                center = (X1_shift,Y1_shift-1)
-                for image in images:
-                    cv2.rectangle(image,(X1_shift,Y1_shift),(int(X1_shift+r[2]),int(Y1_shift+r[3])),(255,0,0),2)
-                    cv2.putText(image,roi_ID,center,font,0.5,(255,0,0),1)
-                count +=1
-            cv2.destroyWindow('Tl/Mn ratio')
-            cv2.destroyWindow('Tl vs Mn intensity map') 
-        tmp = pd.DataFrame.from_dict(data=roi_coord,orient='index',columns=['X1','Y1','width','height'])
-        tmp.to_csv(os.path.join(directory,'roi_coordinates.csv'))
-    return ROI, roi_masks, roi_coord
-
-def pixelLCF(shape,el_norm,nor_vals,ref_list):
-    LCF_1comp = np.zeros((shape[0],shape[1]))
-    LCF_1comp_val = np.zeros((2,shape[0],shape[1]))
-    LCF_1comp_res = np.zeros((shape[0],shape[1]))
-    for x in range(shape[0]):
-        for y in range(shape[1]):
-            LCF_res, LCF_val = np.empty(len(ref_list)),np.empty((len(ref_list),2))
-            for ref in range(len(ref_list)):
-                fit_mat = np.vstack((nor_vals[:,ref],np.zeros(nor_vals[:,ref].shape))).transpose() # we add a variable that is all ones to make it work, not sure if it does something bad or not...
-                tmp_1 = sp.optimize.lsq_linear(fit_mat,el_norm[:,x,y],(0,1)) # for the moment does not work with the general lsq_linear
-                LCF_res[ref] = np.sum(np.array([x1**2 for x1 in tmp_1['fun']]))
-                LCF_val[ref,:] = np.array([x2 for x2 in tmp_1['x']])
-            try:
-                lowest = np.amin(np.ma.masked_equal(LCF_res,0))
-                index = np.where(LCF_res == lowest)[0][0]
-                LCF_1comp[x,y] = index+1 # need to mask the zero values because we are working with masked values, otherwise it will select the first ref always
-                LCF_1comp_val[:,x,y] = LCF_val[index]
-                LCF_1comp_res[x,y] = LCF_res[index]
-            except:
-                LCF_1comp[x,y] = 0
-                LCF_1comp_val[:,x,y] = 0
-        progbar('pixelLCF',x,shape[0]-1,20)
-    return LCF_1comp, LCF_1comp_res, LCF_1comp_val
-
-def pixel_2compLCF(shape,el_norm,nor_vals,couples):
-    LCF_2comp = np.zeros((2,shape[0],shape[1]))
-    LCF_2comp_val = np.zeros((2,shape[0],shape[1]))
-    LCF_2comp_res = np.zeros((shape[0],shape[1]))
-    for x in range(shape[0]):
-        for y in range(shape[1]):
-            LCF_res_2, LCF_val_2 = np.empty(len(couples)), np.empty((len(couples),2))
-            for cpind,couple in enumerate(couples): # the couples are such that the first is the reduced, the second the oxidized
-                tmp_2 = sp.optimize.lsq_linear(nor_vals[:,couple],el_norm[:,x,y],(0,1))
-                LCF_val_2[cpind,:] = np.array([x2 for x2 in tmp_2['x']])
-                LCF_res_2[cpind] = np.sum(np.array([x1**2 for x1 in tmp_2['fun']]))
-            try:
-                lowest2 = np.amin(np.ma.masked_equal(LCF_res_2,0))
-                index2 = np.where(LCF_res_2 == lowest2)[0][0]
-                LCF_2comp[:,x,y] = [x3+1 for x3 in couples[index2]]
-                LCF_2comp_val[:,x,y] = LCF_val_2[index2]
-                LCF_2comp_res[x,y] = LCF_res_2[index2]
-            except:
-                LCF_2comp[:,x,y] = 0
-                LCF_2comp_val[:,x,y] = 0
-                LCF_2comp_res[x,y] = 0
-        progbar('2comp_lcf',x,shape[0]-1,20)
-    return LCF_2comp, LCF_2comp_res, LCF_2comp_val
-
-def LCF_sel(shape,len_red,LCF_2comp, LCF_2comp_val,LCF_2comp_res,LCF_1comp, LCF_1comp_res):
-    LCF_select = np.zeros((3,shape[0],shape[1]))
-    LCF_sel_oxstate = np.zeros((2,shape[0],shape[1]))
-    for x in range(shape[0]):
-        for y in range(shape[1]):
-            if LCF_2comp_res[x,y] <= 0.8*LCF_1comp_res[x,y]:
-                LCF_select[0:2,x,y] = LCF_2comp[:,x,y]
-                LCF_sel_oxstate[:,x,y] = np.ma.fix_invalid(LCF_2comp_val[:,x,y]/np.sum(LCF_2comp_val[:,x,y]),fill_value=0) # this will populate with the values of the components, scaled to 1
-            else:
-                LCF_select[:,x,y] = LCF_1comp[x,y]
-                LCF_sel_oxstate[:,x,y] = np.nan
-                # this part below is to put the 1 component fit as reduced or oxidized
-#                if LCF_1comp[x,y] < len(len_red):
-#                    LCF_sel_oxstate[0,x,y] = LCF_1comp_val[0,x,y]
-#                else:
-#                    LCF_sel_oxstate[1,x,y] = LCF_1comp_val[0,x,y]
-    return LCF_select, LCF_sel_oxstate
-
-def masking(): # returns masks, mask_list, mask_names
-#%%
-    # make the histogram on Mn counts, and scale by the attenuation of Mn vs Tl, remove zero values from allign
-
-    hist_Den = np.histogram(Den_raw_roi,bins=hist_den_bins)
-    Tl_tot_roi = np.sum(array[sel_en][El_sel][x1:x2,y1:y2])
-    
-    # define what is the background value for the denominator mask (we will ignore all values below)
-    # i.e. what is X times lower than the average/median?
-    bg_bin = np.where(hist_Den[0] == np.nanmax(hist_Den[0]))[0]
-    if len(bg_bin) > 1:
-        bg_bin = bg_bin[0]
-        
-    # take the value with most counts, which is assumed as the background
-    threshold = hist_Den[1][bg_bin] 
-    
-    if threshold > 1:
-        threshold = threshold * den_cts_fact
-    else:
-        threshold = threshold + np.abs(threshold*(den_cts_fact-1))
-    
-    # make the mask to remove the background Mn counts
-    mask_Den = np.copy(Den_raw_roi)
-    mask_Den[mask_Den < threshold] = 0
-    mask_Den[mask_Den >= threshold] = 1
-    mask_Den = np.array(mask_Den,bool)
-    # mask for where there is no Mn but Tl, i.e. in the clays
-    bg_msk = np.invert(mask_Den)
-    
-    Den_masked = mask_Den * Den_raw_roi
-    
-    Image.fromarray(mask_Den.astype(int)).save(os.path.join(dir_out[0],'den_threshold_mask.tif'))
-    Image.fromarray(bg_msk.astype(int)).save(os.path.join(dir_out[0],'bg_mask.tif'))
-    
-    
-    
-    # make the ratio mask with ranges based on Tl/Mn values
-    with np.errstate(invalid='ignore',divide='ignore'):
-        #shape_roi = El_raw.shape
-        El_masked = mask_Den*mask_num_roi* El_raw_roi
-        ratio = np.ma.masked_invalid(El_masked/(Den_masked)) # here the ratio betweem Tl and Mn for only the masked pixels is made
-        Image.fromarray(ratio).save(os.path.join(dir_out[0],'ratio_mask.tif'))
-        bg_masked = np.ma.masked_invalid(bg_msk*mask_num_roi * El_raw_roi)
-        ratio_hist = np.histogram(ratio[~np.isnan(ratio)], bins=bins_ratio) # histogram requires no nans
-        bg_hist = np.histogram(bg_masked[np.nonzero(bg_masked)], bins=bg_bins)
-    
-    conc_vs_bg = [np.sum(mask_Den*mask_num_roi*El_raw_roi)/np.sum(mask_Den*mask_num_roi),np.sum(bg_msk*mask_num_roi*El_raw_roi)/np.sum(bg_msk*mask_num_roi)]
-    '''
-    Mask creation on the maps and application
-    make the mask for each range, then apply it to every energy
-    here it can be fixed to not include the last element because it is not
-    correct because of the difference between bins and bin edges (basically last
-    value is empty)
-    '''
-    print('\t# mask application #')
-    print('\t####################')
-    histogram_cts = np.concatenate((ratio_hist[0],bg_hist[0]))
-    histogram_val = np.concatenate((ratio_hist[1][:-1],bg_hist[1][:-1]))
-    hist_val_full = np.concatenate((ratio_hist[1],bg_hist[1]))
-    
-    sel_bins = histogram_cts > min_hist_cts
-    # tmp_ct = (sel_bins == 1).sum()
-    
-    full_bins = histogram_val[sel_bins]
-    
-    masks = {}
-    mask_list = []
-    mask_names = []
-    counts = []
-    ratio_discr_im = np.zeros((ratio.shape))
-    
-    count = 1
-    ratio_purged = np.copy(ratio)
-    bg_purged = np.copy(bg_masked)
-    ratio_purged[np.isnan(ratio_purged)] = 0
-    bg_purged[np.isnan(bg_purged)] = 0
-    
-    Tl_conc_roi = np.sum(El_masked)/Tl_tot_roi
-    Tl_bg_roi = np.sum(bg_purged)/Tl_tot_roi
-    
-    for index1 in range(len(histogram_cts)):
-        if sel_bins[index1]:
-            if index1 < len(ratio_hist[0]):
-                lo_edge = hist_val_full[index1]
-                hi_edge = hist_val_full[index1+1]
-                mask_list.append((lo_edge+hi_edge)/2)
-                mask_names.append('ratio {:.4f} - {:.4f}'.format(lo_edge,hi_edge))
-                counts.append(histogram_cts[index1])
-                rat_lower = ratio_purged > lo_edge
-                rat_higher = ratio_purged <= hi_edge
-                tmp_mask = rat_lower * rat_higher
-            elif index1 >= len(ratio_hist[0]) and len(bg_hist)>1:
-                lo_edge = hist_val_full[index1+1]
-                hi_edge = hist_val_full[index1+2]
-                mask_names.append('bg {:.0f} - {:.0f}'.format(lo_edge,hi_edge,histogram_cts[index1]))
-                mask_list.append((lo_edge+hi_edge)/2)
-                counts.append(histogram_cts[index1])
-                bg_lower = bg_purged > lo_edge
-                bg_higher = bg_purged <= hi_edge
-                tmp_mask = bg_lower * bg_higher
-            if index1 < len(mask_names):
-                msk_nm = mask_names[index1][0:mask_names[index1].find(' ')]
-                name = samp_name+'mask_n{}_{}.tif'.format(index1,msk_nm)
-                Image.fromarray(tmp_mask.astype(int)).save(os.path.join(dir_out[1],name))
-            masks[mask_list[count-1]] = np.copy(tmp_mask)
-            # this part below is to make an image where each selected ratio bin has an increasing integer pixel value
-            tmp_mask[np.isnan(tmp_mask)] = 0
-            tmp_mask[tmp_mask == 1] = count
-            ratio_discr_im += tmp_mask
-            count += 1
-    
-    with open(os.path.join(dir_out[1],'hist_vals.txt'), 'w') as f:
-        tmp_msk = pd.DataFrame(data=full_bins,index=mask_names)
-        tmp_msk.to_csv(f, sep='\t')
-    Image.fromarray(ratio_discr_im).save(os.path.join(dir_out[0],'all_masks_superposed.tif'))
-    mask_output = {0:masks,1:mask_list,2:mask_names,3:Den_raw_roi,4:Tl_conc_roi,5:Tl_bg_roi,6:threshold,7:counts,8:conc_vs_bg}
-#%%
-    return mask_output
 
 ''' 
 code
 '''
+dset_names = [X_name, Y_name,alg_el,El1_name,El2_name,El3_name]
+gridtest = [X_name,Y_name]
 
 ## reading part
 print('###########')
@@ -437,46 +151,56 @@ refs_red_ls = glob.glob(os.path.join(refs_red,'*.nor'))
 refs_ox_ls = glob.glob(os.path.join(refs_ox,'*.nor'))
 redox = ['red','ox']
 ref_list = refs_red_ls+refs_ox_ls
-len_red = range(0,len(refs_red_ls))
-len_ox = range(len(refs_red_ls),len(ref_list))
-couples = [(red,ox) for red in len_red for ox in len_ox]
+red_ls = range(0,len(refs_red_ls))
+ox_ls = range(len(refs_red_ls),len(ref_list))
+couples = [(red,ox) for red in red_ls for ox in ox_ls]
+len_red = len(refs_red_ls)
 
-samples = [os.path.join(path,y) for y in [x[1] for x in os.walk(path)][0]] # read all the samples in all subdirectories
+
+#read hdf5
+
+# read groups, make list
+# read elements (group + / + names of elements)
+
+
+alldirs = [x[0] for x in os.walk(path) if 'extracted' in x[0]]
+filelist = [y for ls in [glob.glob(os.path.join(sub,'*.h5')) for sub in alldirs] for y in ls]
+
+#samples = glob.glob(os.path.join(path,'*.h5'))
+
 if not run_all:
-    samples = [sample for sample in samples if os.path.basename(sample) in run]
-dir_out_root = ['masks','LCF']
-dir_out_r = os.path.join(path,'LCF_out')
-to_remove = [dir_out_r] + [os.path.join(path,ig) for ig in ignore]
-samples = [sample for sample in samples if sample not in to_remove]
+    samples = [sample for sample in filelist if os.path.basename(sample) in run]
+else:
+    samples = [sample for sample in filelist if any(a in sample for a in ignore)]
 
-if master_energy == 1:
-    #att_mass = att_mass_Tl / att_mass_Mn
-    #att_filt = tx_Mn/tx_Tl
-    #tot_att= att_mass / att_filt # this value is then multiplied by Mn to correct, or the reciprocal is multiplied by the Tl/Mn ratio
-    att_Tl = tx_Tl * att_mass_Tl
-    att_Mn = tx_Mn * att_mass_Mn
-    att_As = tx_As * att_mass_As
-elif master_energy == 2:
-    mask_num = mask_num_15
-    els_to_use[1] = 'sort_Tl-Lb'
-    #tot_att = att_mass
-    att_Tl = 1 
-    att_Mn = 1 
-    att_As = 1 
-elif not master_energy: # this is if we are using the 15 kev map deconvoluted.
-    #tot_att = att_mass
-    att_Tl, att_Mn, att_As  = 1 , 1, 1
 
-#attenuations = att_Tl, att_Mn, att_As
 #%%
 samp_count = 0
 for sample in samples:
 #%%
-    samp_name = os.path.basename(sample)+energy_ch[master_energy]
+    dir_out_r = os.path.join(os.path.dirname(sample),'LCF_out')
+    dir_out_root = ['masks','LCF']
+
+    samp_name = os.path.basename(sample)
     print('#*#*#*#*#*#*#*#*#*#*#*#*#')
-    print('running sample {}'.format(samp_name))
-    energies = [os.path.join(sample,y) for  y in [x[1] for x in os.walk(sample)][0]]
+    print('running sample {}'.format(samp_name))  
+    with h5py.File(sample,'r') as f:   
+        energies = list(f.keys())# different groups of the data, as string
+        dset={}
+        for energy in energies:
+            dset[energy] = {}
+            name = f.get(energy)
+            for x in name:
+                if x in dset_names:
+                    dset[energy][x] = name.get(x)[:]
+    # this is to check if the dataset is actually a chemical redox dataset,
+    # and usually if there is less than 3 energies it is not
+    if len(energies) < 3:
+        continue
+                    
     LCF_energies = [energy for energy in energies if out_chem not in energy]
+    en_values = [float(energy) for energy in LCF_energies]
+    
     array, allign = {}, {}
     array = {key:{} for key in energies} # this needs to be the 4D shape of the data. so energies x rois x mapsize
     allign = {key:{} for key in energies}
@@ -484,56 +208,60 @@ for sample in samples:
     this part below is to figure out if and where there is a different sized map in the set.
     the idea is to upsize the small maps to the big one to not loose info of the big ones
     '''
-    if grid:
-        grid = [[np.loadtxt(text) for text in glob.glob(os.path.join(energy,'*.txt'))] for energy in energies]
-        grid_shape = [grid[energy][0].shape for energy in range(len(grid))]
-        grid_dict = {os.path.basename(energy)+'eV':grid_shape[en] for en,energy in enumerate(energies)}
-        gridindex = dict((i, grid_shape.count(i)) for i in grid_shape)
-        if len(gridindex) > 1:
-            print("there is one map that has a different size. I'll interpolate it to the other maps' size (increase)")
-            print('')
-            grid_min_ind = grid_shape.index(min(gridindex))
-            grid_max_ind = grid_shape.index(max(gridindex))
-            tmp = pd.DataFrame(data=grid_dict,index=['X','Y']).transpose()
-            tmp.to_csv(os.path.join(sample,'diagnostic_interpolation.txt'),sep='\t')
-        else:
-            grid_min_ind, grid_max_ind = -1,-1
-#this part below loops over the different energies
+    #load the scanX_set and scanY_set values of the hdf5 images for each energy
+    grid = [[dset[name][val] for val in dset[name].keys() if val in gridtest] for name in dset]
+    grid_shape = [grid[energy][0].shape for energy in range(len(grid))]
+    grid_dict = {energy+'eV':grid_shape[en] for en,energy in enumerate(energies)}
+    gridindex = dict((i, grid_shape.count(i)) for i in grid_shape)
+    
+    if len(gridindex) > 1:
+        print("there is one map that has a different size. I'll interpolate it to the other maps' size (increase)")
+        print('')
+        grid_min_ind = grid_shape.index(min(gridindex))
+        grid_max_ind = grid_shape.index(max(gridindex))
+        tmp = pd.DataFrame(data=grid_dict,index=['X','Y']).transpose()
+        tmp.to_csv(os.path.join(sample,'diagnostic_interpolation.txt'),sep='\t')
+    else:
+        grid_min_ind, grid_max_ind = -1,-1
+    '''            
+    #this part below loops over the different energies
+    # transform it because we don't have to read an image anymore but read as numpy 
+    # arrays the data in the hdf5 file
+    '''
     alg_el_sel = []
     count = 0 # this is to initialize the overall_mismatch variable
     for nen,energy in enumerate(energies): # this will iterate over all energies within a sample.
-        tmp = glob.glob(os.path.join(energy,'rois','*.tif'))
+        tmp = dset[energy]# list of all the rois within a group, or dictionnary
         if moving_avg:
-            sfx = 'mv_avg{}x{}'.format(str(mov_bin),str(mov_bin))
-            filenames = [os.path.basename(y)[:os.path.basename(y).find('.')]+sfx for y in tmp]
+            sfx = 'mv_avg_{}x{}'.format(str(mov_bin),str(mov_bin))
+            # below, filename is not necessary if we have a dictionary with the names of the rois, but keeping for lazyness
+            filenames = [y+sfx for y in tmp.keys()]
         else:
-            filenames = [os.path.basename(y)[:os.path.basename(y).find('.')] for y in tmp]
+            filenames = [y for y in tmp.keys()]
         alg_el_sel.append([filename for filename in filenames if alg_el in filename][0])
         if grid:
             if nen == grid_min_ind:
                 X,Y = (grid[grid_max_ind][0],grid[grid_max_ind][1])
                 for y,x in enumerate(tmp):
-                    array[energy][filenames[y]] = cv2.resize(imread(x),(len(X),len(Y)))
+                    array[energy][filenames[y]] = cv2.resize(tmp[x],(len(X),len(Y)))
                 allign[energy] = {alg_el_sel[nen]:array[energy][alg_el_sel[nen]]}
             else:
-                array[energy] = {filenames[y]:imread(x) for y,x in enumerate(tmp)}
+                array[energy] = {filenames[y]:tmp[x] for y,x in enumerate(tmp)}
                 allign[energy] = {alg_el_sel[nen]:array[energy][alg_el_sel[nen]]}
         else:
-            array[energy] = {filenames[y]:imread(x) for y,x in enumerate(tmp)}
+            array[energy] = {filenames[y]:tmp[x] for y,x in enumerate(tmp)}
             allign[energy] = {alg_el_sel[nen]:array[energy][alg_el_sel[nen]]}
         if count == 0:
             overall_mismatch = np.empty(allign[energies[0]][alg_el_sel[0]].shape)
-
-## 
         '''
         allignment part
-        this algorithm here makes the allignment but requires the files to all have the same shape.
-        maybe there could be some other algorithm that can also allign if the images are different
-        since there should be no rotation, it only fixes translation in X and Y. there should actually
-        only be changes in the Y direction, but there is also probably changes in the beam spot profile
-        which we make the assumption are negligeable (sub-pixel)
+        the idea behind this routine is to allign the images to account for energy-dependent drift
+        by looking at features in a fluorescence map that do not change as a function of incident
+        energy. it requires the files to all have the same shape. it only fixes translation in X and Y. 
+        there should actually only be changes in the Y direction, but there is 
+        also probably changes in the beam spot profile which we make the assumption are negligeable (sub-pixel)
         '''
-        shift, error, diffphase = register_translation(allign[energies[0]][alg_el_sel[0]], allign[energy][alg_el_sel[nen]], 100)
+        shift, error, diffphase = phase_cross_correlation(allign[energies[0]][alg_el_sel[0]], allign[energy][alg_el_sel[nen]],upsample_factor=100)
         diagnostic = sp.ndimage.shift(allign[energy][alg_el_sel[nen]],shift) - allign[energies[0]][alg_el_sel[0]]
         try:
             overall_mismatch = overall_mismatch + np.abs(diagnostic)
@@ -545,20 +273,19 @@ for sample in samples:
             # this algorithm below makes the shift based on the calculated translation.
             array[energy][key] = sp.ndimage.shift(array[energy][key],shift)
             if moving_avg:
-                array[energy][key] = mov_avg(array[energy][key])
-                dirname =  samp_name+'_out_movavg_{}x{}'.format(str(mov_bin),str(mov_bin))
+                array[energy][key] = mul.mov_avg(array[energy][key],movavg_shape,mov_bin)
+                dirname =  os.path.join(dir_out_r,'out_movavg_{}x{}'.format(str(mov_bin),str(mov_bin)))
             else:
-                dirname = samp_name +'_out'
+                dirname = os.path.join(dir_out_r,'out')
             out_all = os.path.join(dir_out_r,dirname,'allign',os.path.basename(energy))
-            safe_mkdir(out_all)
+            mul.safe_mkdir(out_all)
             img1 = Image.fromarray(array[energy][key])
             img_name = os.path.join(out_all,key+'_alligned.tif') # check if it actually works here
             img1.save(img_name)
         count += 1
-    dirname = os.path.join(dir_out_r,dirname)
     dir_out = [os.path.join(dirname,direc) for direc in dir_out_root]
     for direc in dir_out:
-        safe_mkdir(direc)
+        mul.safe_mkdir(direc)
     diag = Image.fromarray(overall_mismatch)
     diag_name = os.path.join(os.path.dirname(out_all),'%s_allign_diag.tif' % alg_el)
     diag.save(diag_name)
@@ -584,14 +311,6 @@ for sample in samples:
             else:
                 nor_vals[en,index] = np.mean(value)
     nor_vals = nor_vals/nor_vals[-1] # this is make the refs similar to the data (last energy is 1 in the data)--> "normalizing" the references also in case they were not already
-# correcting the attenuation, currently not working correctly, probably due to As being taken from LCF energies
-    
-#    for energy in array:
-#        for ind,el in enumerate(els_to_use):
-#            for key in array[energy]:
-#                if el in array[energy][key]:
-#                    array[energy][key] = array[energy][key]*attenuations[ind]
-    
     
     '''
     normalization part -- CAN STILL BE IMPROVED MAYBE?
@@ -599,33 +318,40 @@ for sample in samples:
     the highest energy map, and the minimum for the lowest energy map to normalize the data.
     this may be not the best solution, but I did not find something better for the moment
     '''
-    # here below divide by the attenuation of Tl by the filter
-    hi_El = array[LCF_energies[-1]][[k for k in array[LCF_energies[-1]] if mask_num in k][0]]/att_Tl
-    lo_El = array[LCF_energies[0]][[k for k in array[LCF_energies[0]] if mask_num in k][0]]/att_Tl
-    As_map = array[energies[-1]][[k for k in array[energies[-1]] if third_element in k][0]]/att_mass_As # takes 15 kev map
-    Tl_map = array[energies[-1]][[k for k in array[energies[-1]] if mask_num in k][0]]/att_mass_Tl
-    Mn_map = array[energies[-1]][[k for k in array[energies[-1]] if mask_den in k][0]]/att_mass_Mn
+    # here below divide by the attenuation of El1 by the filter
+    hi_El = array[LCF_energies[-1]][[k for k in array[LCF_energies[-1]] if El1_name in k][0]]
+    lo_El = array[LCF_energies[0]][[k for k in array[LCF_energies[0]] if El1_name in k][0]]
+    El3_map = array[LCF_energies[-1]][[k for k in array[LCF_energies[-1]] if El3_name in k][0]] # takes highest energy map
+    El1_map = array[LCF_energies[-1]][[k for k in array[LCF_energies[-1]] if El1_name in k][0]]
+    El2_map = array[LCF_energies[-1]][[k for k in array[LCF_energies[-1]] if El2_name in k][0]]
     
-    if master_energy:
-        sel_en = LCF_energies[-1]
+    correct_vals = [El3_map,El1_map,El2_map]
+    names = ['El3_atten','El1_atten','El2_atten']
+    dir_atten = mul.safe_mkdir(os.path.join(dirname,'attenuation_corrected'),1)
+    for ind_att,mp in enumerate(correct_vals):
+        Image.fromarray(mp).save(os.path.join(dir_atten,names[ind_att]+'.tif'))
+    if El1_masking:
+        El1_mask = np.copy(El1_map)
+        El1_mask[El1_mask<=El1_threshold] = 0
+        El1_mask[El1_mask>El1_threshold] = 1
     else:
-        try: # selection of the correct ROI (Tl and Mn) at the right energy from the dictionaries
-            sel_en = [en for en in energies if out_chem in en][0]
-        except:
-            print('there is no datafile for the mask energy (i.e. high energy overview map), using highest energy available')
-            print('')
-            sel_en = LCF_energies[-1]
-    El_sel = [k for k in array[sel_en] if mask_num in k][0]
-    Den_sel = [k for k in array[sel_en] if mask_den in k][0]
-    Den_raw = np.ma.masked_less(array[sel_en][Den_sel],1)/att_Mn
-    El_raw = np.ma.masked_less(array[sel_en][El_sel],1)/att_Tl
-    hi_El_msk = np.ma.masked_array(hi_El,Den_raw.mask)   
-    lo_El_msk = np.ma.masked_array(lo_El,Den_raw.mask) 
-    Tl_int_scal = np.ma.fix_invalid(hi_El/np.nanmax(hi_El),fill_value=0)
-    Mn_int_scal = np.ma.fix_invalid(Den_raw/np.nanmax(Den_raw),fill_value=0)
+        El1_mask = np.ones(np.shape(El1_map))
+    
+    sel_en = LCF_energies[-1]
+            
+    El_sel = [k for k in array[sel_en] if El1_name in k][0]
+    Den_sel = [k for k in array[sel_en] if El2_name in k][0]
+    Den_raw = np.ma.masked_less(array[sel_en][Den_sel]*El1_mask,1)
+    El_raw = np.ma.masked_less(array[sel_en][El_sel]*El1_mask,1)
+    hi_El_msk = np.ma.masked_array(hi_El,Den_raw.mask)
+    lo_El_msk = np.ma.masked_array(lo_El,Den_raw.mask)
+    El1_int_scal = np.ma.fix_invalid(hi_El/np.nanmax(hi_El),fill_value=0)
+    El2_int_scal = np.ma.fix_invalid(Den_raw/np.nanmax(Den_raw),fill_value=0)
+
+### all changes for hdf5 reading are up to here, below everything should be fine###
 # mask for all data
     '''
-    here is a mask to select only the pixels with minimum counts higher than background for Tl
+    here is a mask to select only the pixels with minimum counts higher than background for El1
     it takes the mean value of the highest energy map and uses this as a threshold for creating a num_mask
     '''
     if mask:
@@ -635,13 +361,13 @@ for sample in samples:
             mask_Num = np.greater_equal(hi_El,np.mean(lo_El))
         Image.fromarray(mask_Num.astype(int)).save(os.path.join(dir_out[1],'num_mask.tif'))
     else:
-        mask_Num = np.ones(np.shape(hi_El))    
-        
+        mask_Num = np.ones(np.shape(hi_El))
+
 # population of the arrays with normalized data, fixed for attenuation of filter
     el_norm = np.zeros((len(LCF_energies),shape[0],shape[1]))
     for Eind, energy in enumerate(LCF_energies):
-        sel_El = [k for k in array[energy] if mask_num in k][0]
-        data = (((array[energy][sel_El])/att_Tl-lo_El)/(hi_El-lo_El))*mask_Num # used to be att
+        sel_El = [k for k in array[energy] if El1_name in k][0]
+        data = (((array[energy][sel_El]*El1_mask)-lo_El)/(hi_El-lo_El))*El1_mask # used to be att
         el_norm[Eind,:,:] = np.ma.fix_invalid(data,fill_value=0)
 
     ''' 
@@ -654,9 +380,8 @@ for sample in samples:
     '''
 
 # ROI selection
-    
     if ROI_opt:
-        ROI, roi_masks, roi_coord = ROIs(sel_roi,el_norm, hi_El, Den_raw, dirname)
+        ROI, roi_masks, roi_coord = mul.ROIs(sel_roi,el_norm, hi_El, Den_raw, dirname,image_scl)
         outfilename = 'roi.csv'
     else:
         ROI, roi_masks = {},{}
@@ -670,134 +395,69 @@ for sample in samples:
 
 #%%    
     valid_roi = [roi for roi in ROI if ROI[roi].size] #  this is because the quit does not always work
-    El_avgs = {roi:{} for roi in valid_roi}
-    LCF_head1 = ['roi','counts','pixel_counts','ratio avg','Tl counts avg','Mn counts avg','As_counts_avg','Tl_conc / Tl_tot']
-    LCF_head2 = ['Tl_bg / Tl_tot','LCF_1comp','LCF_1comp_val','LCF_1comp_nssr','LCF_2comp','LCF_2comp_norm_val','ox%']
-    LCF_head3 = ['LCF_2comp_nssr', 'better 2 vs 1?','Tl counts concretion vs bg']
-    header = LCF_head1 + LCF_head2 + LCF_head3
+    LCF_dict= {}
     LCF_avg = {}
+    allpix = {}
+    spectrum = {}
+    
     for roi_ind,roi in enumerate(valid_roi):      
+        print('\t')
+        print('\t# running roi {} of {} #'.format(roi_ind,len(valid_roi)+1))
+        print('\t#################')
         dir_out = [os.path.join(dirname,roi,xpath) for xpath in dir_out_root]  
-        [safe_mkdir(dir_tmp) for dir_tmp in dir_out]
+        [mul.safe_mkdir(dir_tmp) for dir_tmp in dir_out]
         x1,x2,y1,y2 = roi_masks[roi]
         
         hi_el_roi = hi_El[x1:x2,y1:y2]
         Den_raw_roi = Den_raw[x1:x2,y1:y2]
         El_raw_roi = El_raw[x1:x2,y1:y2]
-        mask_num_roi = mask_Num[x1:x2,y1:y2]
-        As_roi = As_map[x1:x2,y1:y2]
-        Tl_roi = Tl_map[x1:x2,y1:y2]
-        Mn_roi = Mn_map[x1:x2,y1:y2]
-        Tl_int_scal_roi = Tl_int_scal[x1:x2,y1:y2]
-        Mn_int_scal_roi = Mn_int_scal[x1:x2,y1:y2]
-        '''
-        making the mask based on histogram for low Mn and Tl counts
-        this part may require to observe the data, so an iterative process until happy.
-        it is done now on based assumptions on the data, but there can be a second
-        script that allows user imput for example if the masks are to be based on geometries
-        to pick on a specific image
-        '''
-        print('\t# mask creation #')
-        print('\t#################')
-
-        if variant_comparison:
-            if samp_count == 0:
-                mask_output = masking()
-            # do something
-        else:
-           mask_output = masking()# masking
-
-# creation of masked-averaged datasets based on mask created above
-        threshold = mask_output[6]
-        mask_names = mask_output[2]
-        counts = mask_output[7]
-        mask_list = mask_output[1]
-        Tl_conc_roi = mask_output[4]
-        Tl_bg_roi = mask_output[5]
-        El_avgs[roi] = {key:np.zeros(len(LCF_energies)) for key in mask_names}
-        Tl_avg, Mn_avg, As_avg = {},{},{}
-        mask_counts = {}
-        for Mind,bin_mask in enumerate(mask_list): # Mind is the index
-            masks = mask_output[0][bin_mask]
-            mask_data = ROI[roi]*masks
-            mask_counts[mask_names[Mind]] = np.sum(mask_output[0][bin_mask])
-            if np.isnan(data).all():
-                El_avgs[roi][mask_names[Mind]] = np.nan
-            else:
-                tmp = np.ma.filled(np.mean(np.ma.masked_invalid(mask_data),axis=(1,2)),np.nan)
-                El_avgs[roi][mask_names[Mind]] = tmp/tmp[-1]
-                #Tl_avg[mask_names[Mind]] = np.mean(np.ma.masked_less(hi_el_roi*masks,1))
-                #Mn_avg[mask_names[Mind]] = np.mean(np.ma.masked_less(mask_output[3]*masks,threshold))
-                Tl_avg[mask_names[Mind]] = np.nanmean(Tl_roi*masks)
-                Mn_avg[mask_names[Mind]] = np.nanmean(Mn_roi*masks)
-                As_avg[mask_names[Mind]] = np.nanmean(As_roi*masks)
-
-        '''
-        run 1, 2 comp on binned data
-        for averages: applies the masks to each energy map and averages the
-        values within each bin range, after normalizing the data
-        '''
-        print('\t# LCF on masked averages #')
-        print('\t##########################')
-
-        for ind,avg in enumerate(El_avgs[roi]): # here it may be an issue for the order since it is a dict...
-            if ~np.isnan(El_avgs[roi][avg][:]).any():
-                LCF_avg1,LCF_avg2 = [],[]
-                LCF_avgres1, LCF_avgres2 = [],[]
-                for ref in range(len(ref_list)):
-                    fit_mat = np.vstack((nor_vals[:,ref],np.zeros(nor_vals[:,ref].shape))).transpose() # we add a variable that is all ones to make it work, not sure if it does something bad or not...
-                    tmp_1 = sp.optimize.lsq_linear(fit_mat,El_avgs[roi][avg],(0,1))
-                    LCF_avgres1.append(np.sum(np.array([x1**2 for x1 in tmp_1['fun']])))
-                    LCF_avg1.append(np.array([x2 for x2 in tmp_1['x']]))
-                for couple in couples:
-                    tmp_2 = sp.optimize.lsq_linear(nor_vals[:,couple],El_avgs[roi][avg],(0,1))
-                    LCF_avg2.append(np.array([x2 for x2 in tmp_2['x']]))
-                    LCF_avgres2.append(np.sum(np.array([x1**2 for x1 in tmp_2['fun']])))
-                lowest = [min(np.ma.masked_equal(LCF_avgres1,0)), min(np.ma.masked_equal(LCF_avgres2,0))]
-                try:
-                    ind1 = LCF_avgres1.index(lowest[0])
-                    ind2 = LCF_avgres2.index(lowest[1])
-                    text1 = [roi,counts[ind],mask_counts[avg],mask_list[ind],Tl_avg[avg],Mn_avg[avg],As_avg[avg]]
-                    text2 = [Tl_conc_roi,Tl_bg_roi,ref_head[ind1],LCF_avg1[ind1],LCF_avgres1[ind1]]
-                    text3 = [[ref_head[ref] for ref in couples[ind2]],LCF_avg2[ind2]/np.sum(LCF_avg2[ind2])]
-                    text4 = [np.around(LCF_avg2[ind2][1]/np.sum(LCF_avg2[ind2]),decimals=3)]
-                    text5 = [LCF_avgres2[ind2],LCF_avgres2[ind2]<0.8*LCF_avgres1[ind1], mask_output[8]]
-                    LCF_avg[str(roi_ind)+' '+avg] = text1+text2+text3+text4+text5
-                except:
-                    continue
-    
-
-    # this part saves all the pixel results as images
+        mask_Num_roi = mask_Num[x1:x2,y1:y2]
+        El1_mask_roi = El1_mask[x1:x2,y1:y2]
+        El3_roi = El3_map[x1:x2,y1:y2]
+        El1_roi = El1_map[x1:x2,y1:y2]
+        El2_roi = El2_map[x1:x2,y1:y2]
+        El1_int_scal_roi = El1_int_scal[x1:x2,y1:y2]
+        El2_int_scal_roi = El2_int_scal[x1:x2,y1:y2]
+        # this part saves all the pixel results as images
         shape_roi = (x2-x1,y2-y1)    
         G = np.zeros((shape_roi[0],shape_roi[1]))
+        allpix[roi] = pd.DataFrame({'{}_roi'.format(El1_name):np.ma.masked_less_equal(El1_roi*El1_mask_roi,0).flatten(),
+                  '{}_roi'.format(El2_name):np.ma.masked_less_equal(El2_roi*El1_mask_roi,0).flatten(), 
+                  '{}/{}_roi'.format(El1_name,El2_name):np.ma.masked_less_equal(El1_roi*El1_mask_roi,0).flatten()/np.ma.masked_less_equal(El2_roi*El1_mask_roi,1).flatten(),
+                  '{}_roi'.format(El3_name):np.ma.masked_less_equal(El3_roi*El1_mask_roi,0).flatten()})
+        roi_el_norm = el_norm[:,x1:x2, y1:y2]
+        roi_spectrum = np.mean(roi_el_norm.reshape(len(LCF_energies), -1), 1)
+        spectrum[roi] = pd.Series(roi_spectrum, index=en_values)
         
-        if roi_lcf:    
+
+        if roi_lcf:
             print('\n\t# running pixel LCF on ROI %s #' %roi)
             print('\t#################')
                   
-            roi_el_norm = el_norm[x1:x2,y1:y2]
+
             shape_roi = (x2-x1,y2-y1) # this could be 1 less than what it should be
+            if sum(shape_roi) <= 2:
+                continue
             LCF_sel_header = ['2comp_red','2comp_ox','1comp']
 
-            
             print('\n\t# saving ROI %s images #' %roi)
             print('\t#################')
             
-            LCF_1comp, LCF_1comp_res, LCF_1comp_val = pixelLCF(shape_roi,ROI[roi],nor_vals,ref_list)
-            LCF_2comp, LCF_2comp_res, LCF_2comp_val = pixel_2compLCF(shape_roi,ROI[roi],nor_vals,couples)
-            LCF_select, LCF_sel_oxstate = LCF_sel(shape_roi,len_red,LCF_2comp, LCF_2comp_val,LCF_2comp_res,LCF_1comp, LCF_1comp_res)
+            LCF_1comp, LCF_1comp_res, LCF_1comp_val = mul.pixelLCF(shape_roi,ROI[roi],nor_vals,ref_list)
+            LCF_2comp, LCF_2comp_res, LCF_2comp_val = mul.pixel_2compLCF(shape_roi,ROI[roi],nor_vals,couples)
+            LCF_select, LCF_sel_oxstate = mul.LCF_sel(shape_roi,len_red,LCF_2comp, LCF_2comp_val,LCF_2comp_res,LCF_1comp, LCF_1comp_res)
             
-            RGB = RGB_fun(LCF_sel_oxstate[0],G,LCF_sel_oxstate[1])
+            RGB = mul.RGB_fun(LCF_sel_oxstate[0],G,LCF_sel_oxstate[1])
             cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_nssr_sel.tif'),RGB)
             
-            RGB = RGB_fun(LCF_2comp_val[0],G,LCF_2comp_val[1])
+            RGB = mul.RGB_fun(LCF_2comp_val[0],G,LCF_2comp_val[1])
             cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_abs.tif'),RGB)
             
-            RGB_scTl = RGB_fun(LCF_sel_oxstate[0]*Tl_int_scal_roi,G,LCF_sel_oxstate[1]*Tl_int_scal_roi)
-            cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_TlIntScale.tif'),RGB_scTl)
+            RGB_scEl1 = mul.RGB_fun(LCF_sel_oxstate[0]*El1_int_scal_roi,G,LCF_sel_oxstate[1]*El1_int_scal_roi)
+            cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_{}.tif'.format(El1_name)),RGB_scEl1)
         
-            RGB_scMn = RGB_fun(LCF_sel_oxstate[0]*Mn_int_scal_roi,G,LCF_sel_oxstate[1]*Mn_int_scal_roi)
-            cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_MnIntScale.tif'),RGB_scMn)
+            RGB_scEl2 = mul.RGB_fun(LCF_sel_oxstate[0]*El2_int_scal_roi,G,LCF_sel_oxstate[1]*El2_int_scal_roi)
+            cv2.imwrite(os.path.join(dir_out[1], roi+'_redR_nanG_oxB_{}.tif'.format(El2_name)),RGB_scEl2)
             
             Image.fromarray(LCF_1comp).save(os.path.join(dir_out[1], roi+'1comp_rating.tif' ))
             Image.fromarray(LCF_1comp_res).save(os.path.join(dir_out[1], roi+'1comp_NSSR.tif' ))
@@ -808,37 +468,56 @@ for sample in samples:
             for num,comp in enumerate(LCF_2comp_val):
                 Image.fromarray(LCF_2comp_val[num]).save(os.path.join(dir_out[1], roi+'_2comp_%s_val.tif' % redox[num]))
                 Image.fromarray(LCF_sel_oxstate[num]).save(os.path.join(dir_out[1], roi+'_2comp_norm%s_val.tif' % redox[num]))
-            # below it saves an RGB image where Red is th
 
             for ind, index in enumerate(LCF_select):
                 Image.fromarray(index).save(os.path.join(dir_out[1], roi+'LCF_sel_%s_rating.tif' % LCF_sel_header[ind]))
-        
-        third_el = [k for k in array[sel_en] if third_element in k][0]
+            refs_corr = ['no LCF']+ref_head
+            refs = pd.DataFrame([[refs_corr[b] for b in a] for a in LCF_2comp.reshape(2,-1).T.astype(int)],
+                                columns=['LCF_ref_ox','LCF_ref_red'])
+            allpix[roi]['{}_Ox'.format(El1_name)]=np.ma.masked_invalid(LCF_sel_oxstate[1]).flatten()
+            allpix[roi] = allpix[roi].join(refs)
+
+            # make the correlations of El1 and El2 with oxidation state
+            cleaned = allpix[roi].dropna()
+            plt.rcParams.update({'font.size':18})
+            points = plt.scatter(cleaned['{}_roi'.format(El2_name)],cleaned['{}_roi'.format(El1_name)],
+                                 c=cleaned['{}_Ox'.format(El1_name)],vmin = 0, vmax = 1,s=10,cmap='Spectral_r')
+            m,b = np.polyfit(cleaned['{}_roi'.format(El2_name)],cleaned['{}_roi'.format(El1_name)],1)
+            cbar = plt.colorbar(points)
+            cbar.set_label('{}(Ox) percent'.format(El1_name))
+            plt.xlim(cleaned['{}_roi'.format(El2_name)].min()-10,cleaned['{}_roi'.format(El2_name)].max()+10)
+            plt.ylim(cleaned['{}_roi'.format(El1_name)].min()-10,cleaned['{}_roi'.format(El1_name)].max()+10)
+            sb_plt = sns.regplot('{}_roi'.format(El2_name),'{}_roi'.format(El1_name),data=cleaned,scatter = False,color='.1',
+                                 line_kws={'color':'red','linestyle':'dashed'})
+            sb_plt.set(ylabel='{} raw counts'.format(El1_name),xlabel='{} raw counts'.format(El2_name))
+            plt.text(cleaned['{}_roi'.format(El2_name)].min()-10,cleaned['{}_roi'.format(El1_name)].max(),
+                     'regr. vals\n{}/{} = {}\n{} background = {}'.format(El1_name,El2_name,round(m,3),El1_name,round(b,3)),alpha=.75)
+            plt.savefig(os.path.join(dir_out[1],'{}_{}_{}_correlations.svg'.format(roi,El1_name,El2_name)))
+            plt.close()
+            
+            
+        third_el = [k for k in array[sel_en] if El3_name in k][0]
         third_el2 = array[sel_en][third_el]
-        RGB_Mn = RGB_fun(Den_raw_roi,G,hi_el_roi)
-        cv2.imwrite(os.path.join(dir_out[1], roi+'_MnR_nanG_TlB_scaleint.tif'),RGB_Mn)
         
-        RGB_TlInt = RGB_fun(Den_raw_roi*Tl_int_scal_roi,G,hi_el_roi*Tl_int_scal_roi)
-        cv2.imwrite(os.path.join(dir_out[1], roi+'_MnR_nanG_TlB_scaleTl.tif'),RGB_TlInt)
+        RGB_El2 = mul.RGB_fun(Den_raw_roi,G,hi_el_roi)
+        cv2.imwrite(os.path.join(dir_out[1], roi+'_{}R_nanG_{}B_scaleint.tif'.format(El2_name, El1_name)),RGB_El2)
         
-        RGB_MnInt = RGB_fun(Den_raw_roi*Mn_int_scal_roi,G,hi_el_roi*Mn_int_scal_roi)
-        cv2.imwrite(os.path.join(dir_out[1], roi+'_MnR_nanG_TlB_scaleMn.tif'),RGB_MnInt)
+        RGB_El1Int = mul.RGB_fun(Den_raw_roi*El1_int_scal_roi,G,hi_el_roi*El1_int_scal_roi)
+        cv2.imwrite(os.path.join(dir_out[1], roi+'_{}R_nanG_{}B_scale{}.tif'.format(El2_name, El1_name, El1_name)),RGB_El1Int)
         
+        RGB_El2Int = mul.RGB_fun(Den_raw_roi*El2_int_scal_roi,G,hi_el_roi*El2_int_scal_roi)
+        cv2.imwrite(os.path.join(dir_out[1], roi+'_{}R_nanG_{}B_scale{}.tif'.format(El2_name, El1_name,El1_name)),RGB_El2Int)
+#%%        
 # save all the text files with elaborated results
     tmp = pd.DataFrame(data={str(index+1):ref for index,ref in enumerate(ref_head)},index = ['reference'])
     tmp = tmp.transpose()
-    tmp.to_csv(os.path.join(dirname,dir_out_root[1],'ref_list.csv'))
-
-# this saves the masked averaged LCF data
-    tmp = pd.DataFrame.from_dict(LCF_avg,orient='index',columns=header)
-    #tmp = tmp.transpose()
-    tmp.to_csv(os.path.join(dirname,dir_out_root[1],'LCF_masked_avg'+outfilename))
 
 # this is raw if wanting to look at the pseudo xanes
-    for ind,ref in enumerate(ref_head):
-        El_avgs[valid_roi[0]][ref] = nor_vals[:,ind]
-    tmp = pd.DataFrame.from_dict({(i,j):El_avgs[i][j] for i in El_avgs.keys() 
-                for j in El_avgs[i].keys()},orient='index',columns=
-                [os.path.basename(energy) for energy in LCF_energies])
-    tmp.to_csv(os.path.join(dirname,dir_out_root[1],'raw_masked_avg'+outfilename))
+    roi_option = ['fullmap','rois']
+    im_lcf = ['no_im_lcf','im_lcf']
+    with pd.ExcelWriter(os.path.join(dirname,dir_out_root[1],'output_{}_{}.xlsx'.format(roi_option[ROI_opt],im_lcf[roi_lcf]))) as writer:
+        tmp.to_excel(writer,sheet_name='ref_list')
+        for roi in valid_roi:
+            allpix[roi].to_excel(writer,sheet_name='{}_allpixels'.format(roi))
+            spectrum[roi].to_excel(writer,sheet_name='{}_avg_spectrum'.format(roi))
     samp_count +=1
